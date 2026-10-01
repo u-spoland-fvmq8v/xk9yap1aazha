@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: MIT
+
+#ifndef RGBDS_PLATFORM_HPP
+#define RGBDS_PLATFORM_HPP
+
+// MingGW and Cygwin may need POSIX functions which are not standard C explicitly enabled
+// Make sure to keep this before any system header!
+#if (defined(__MINGW32__) || defined(__CYGWIN__)) && !defined(_POSIX_C_SOURCE)
+	#define _POSIX_C_SOURCE 200809L
+#endif
+
+// MSVC doesn't have str(n)casecmp, use a suitable replacement
+#ifdef _MSC_VER
+	#include <string.h> // IWYU pragma: export
+	#define strcasecmp  _stricmp
+	#define strncasecmp _strnicmp
+#else
+	#include <strings.h> // IWYU pragma: export
+#endif
+
+// MSVC prefixes the names of S_* macros with underscores,
+// and doesn't define any S_IS* macros; define them ourselves
+#ifdef _MSC_VER
+	#define S_IFMT        _S_IFMT
+	#define S_IFDIR       _S_IFDIR
+	#define S_ISDIR(mode) (((mode) & (S_IFMT)) == S_IFDIR)
+#endif
+
+// MSVC doesn't use POSIX types or defines for `read`
+#ifdef _MSC_VER
+	#include <io.h> // IWYU pragma: export
+	#define STDIN_FILENO  0
+	#define STDOUT_FILENO 1
+	#define STDERR_FILENO 2
+	#define ssize_t       int
+	#define SSIZE_MAX     INT_MAX
+	#define isatty        _isatty
+#else
+	#include <fcntl.h>  // IWYU pragma: export
+	#include <limits.h> // IWYU pragma: export
+	#include <unistd.h> // IWYU pragma: export
+#endif
+
+// MSVC uses a different name for O_RDWR, and needs an additional _O_BINARY flag
+#ifdef _MSC_VER
+	#include <fcntl.h> // IWYU pragma: export
+	#define O_RDWR         _O_RDWR
+	#define S_ISREG(field) ((field) & (_S_IFREG))
+	#define O_BINARY       _O_BINARY
+	#define O_TEXT         _O_TEXT
+#elif !defined(O_BINARY) // Cross-compilers define O_BINARY
+	#define O_BINARY 0   // POSIX says we shouldn't care!
+	#define O_TEXT   0   // Assume that it's not defined either
+#endif                   // _MSC_VER
+
+// MSVC doesn't have POSIX `ftruncate`, use a suitable replacement
+#if defined(_MSC_VER)
+	#include <io.h> // IWYU pragma: export
+	#define ftruncate _chsize_s
+#endif
+
+// Windows has stdin and stdout open as text by default, which we may not want
+#if defined(_MSC_VER) || defined(__MINGW32__)
+	#include <io.h> // IWYU pragma: export
+	#define setmode(fd, mode) _setmode(fd, mode)
+#else
+	#define setmode(fd, mode) (0)
+#endif
+
+// Windows has 32-bit `long`, which limits `fseek` and `ftell` to 2 GiB
+#if defined(_MSC_VER) || defined(__MINGW32__)
+	#include <stdio.h> // IWYU pragma: export
+	#define fseek _fseeki64
+	#define ftell _ftelli64
+#endif
+
+// Apple has deprecated `sprintf` since Xcode 14 (for macOS 13), but we use it solely in
+// contexts where both the size of the buffer *and* max size of the printed string are
+// known statically, which GCC thus checks for.
+#ifdef __APPLE__
+	#define sprintf_to_array(array, ...) \
+		do { \
+			static_assert( \
+			    std::is_array_v<decltype(array)>, "Only use this macro to print to an array!" \
+			); \
+			snprintf(array, sizeof(array), __VA_ARGS__); \
+		} while (0)
+
+#else
+	#define sprintf_to_array(array, ...) \
+		do { \
+			static_assert( \
+			    std::is_array_v<decltype(array)>, "Only use this macro to print to an array!" \
+			); \
+			sprintf(array, __VA_ARGS__); \
+		} while (0)
+#endif
+
+#endif // RGBDS_PLATFORM_HPP

@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MIT
+
+#ifndef RGBDS_HELPERS_HPP
+#define RGBDS_HELPERS_HPP
+
+#include <type_traits>
+
+// Ideally we'd use `std::unreachable`, but it has insufficient compiler support
+#ifdef __GNUC__ // GCC or compatible
+	#ifdef NDEBUG
+		#define unreachable_ __builtin_unreachable
+	#else
+		// In release builds, define "unreachable" as such, but trap in debug builds
+		#define unreachable_ __builtin_trap
+	#endif
+#else
+// This seems to generate similar code to __builtin_unreachable, despite different semantics
+// Note that executing this is undefined behavior (declared [[noreturn]], but does return)
+[[noreturn]]
+static inline void unreachable_() {
+}
+#endif
+
+// Ideally we'd use `[[assume()]]`, but it has insufficient compiler support
+#ifdef NDEBUG
+	#ifdef _MSC_VER
+		#define assume(x) __assume(x)
+	#else
+		// `[[gnu::assume()]]` for GCC or compatible also has insufficient support (GCC 13+ only)
+		#define assume(x) \
+			do { \
+				if (!(x)) { \
+					unreachable_(); \
+				} \
+			} while (0)
+	#endif
+#else
+	// In release builds, define "assume" as such, but `assert` in debug builds
+	#include <assert.h>
+	#define assume assert
+#endif
+
+// Ideally we'd use `std::bit_width`, but it has insufficient compiler support
+#ifdef __GNUC__ // GCC or compatible
+	#define ctz __builtin_ctz
+	#define clz __builtin_clz
+
+#elif defined(_MSC_VER)
+	#include <intrin.h>
+	#pragma intrinsic(_BitScanReverse, _BitScanForward)
+
+static inline int ctz(unsigned int x) {
+	assume(x != 0);
+	unsigned long count;
+	_BitScanForward(&count, x);
+	return count;
+}
+
+static inline int clz(unsigned int x) {
+	assume(x != 0);
+	unsigned long count;
+	_BitScanReverse(&count, x);
+	return 31 - count;
+}
+
+#else
+	#include <limits.h>
+
+static inline int ctz(unsigned int x) {
+	assume(x != 0);
+	int count = 0;
+	while (!(x & 1)) {
+		x >>= 1;
+		++count;
+	}
+	return count;
+}
+
+static inline int clz(unsigned int x) {
+	assume(x != 0);
+	int count = 0;
+	while (x <= UINT_MAX / 2) {
+		x <<= 1;
+		++count;
+	}
+	return count;
+}
+#endif
+
+// Macros for stringification
+#define STR(x)            #x
+#define EXPAND_AND_STR(x) STR(x)
+
+// Macros for concatenation
+#define CAT(x, y)            x##y
+#define EXPAND_AND_CAT(x, y) CAT(x, y)
+
+// For lack of <ranges>, this adds some more brevity
+#define RANGE(s)  std::begin(s), std::end(s)
+#define RRANGE(s) std::rbegin(s), std::rend(s)
+
+// Macros to print-format a `std::string_view` (like <inttype.h> macros)
+#define PRI_SV         ".*s"
+#define PRI_SV_ARG(sv) static_cast<int>((sv).length()), (sv).data()
+
+// MSVC does not inline `strlen()` or `.length()` of a constant string
+template<int SizeOfString>
+    requires(SizeOfString > 0)
+static constexpr int literal_strlen(char const (&)[SizeOfString]) {
+	return SizeOfString - 1; // Don't count the ending '\0'
+}
+
+// Concept for template parameters that must be an `enum` type
+template<typename EnumT>
+concept Enum = std::is_enum_v<EnumT>;
+
+// Concept for template parameters that must be a function returning `void`
+template<typename ProcedureFnT, typename... Args>
+concept Procedure = std::is_void_v<std::invoke_result_t<ProcedureFnT, Args...>>;
+
+// Concept for template parameters that must be a function returning a particular type
+template<typename FnT, typename ReturnT, typename... Args>
+concept InvocableR = std::is_invocable_r_v<ReturnT, FnT, Args...>;
+
+// Concept for template parameters that must match a particular type modulo cv-qualifiers
+template<typename T, typename UnqualifiedT>
+concept QualifiedEquivalent = std::is_same_v<std::remove_cvref_t<T>, UnqualifiedT>;
+
+// For ad-hoc RAII in place of a `defer` statement or cross-platform `__attribute__((cleanup))`
+template<Procedure DeferredFnT>
+struct Defer {
+	DeferredFnT deferred;
+	Defer(DeferredFnT func) : deferred(func) {}
+	~Defer() { deferred(); }
+};
+
+#endif // RGBDS_HELPERS_HPP

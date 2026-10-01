@@ -1,0 +1,2435 @@
+// SPDX-License-Identifier: MIT
+
+#include "platform.hpp"
+
+#include "asm/lexer.hpp"
+#include <sys/stat.h>
+
+#include <algorithm>
+#include <concepts> // predicate
+#include <errno.h>
+#include <fcntl.h>
+#include <fstream>
+#include <inttypes.h>
+#include <ios>
+#include <limits.h>
+#include <math.h>
+#include <memory>
+#include <optional>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "helpers.hpp"
+#include "style.hpp"
+#include "util.hpp"
+#include "verbosity.hpp"
+
+#include "asm/format.hpp"
+#include "asm/fstack.hpp"
+#include "asm/intern.hpp"
+#include "asm/macro.hpp"
+#include "asm/main.hpp"
+#include "asm/rpn.hpp"
+#include "asm/symbol.hpp"
+#include "asm/warning.hpp"
+// Include this last so it gets all type & constant definitions
+#include "parser.hpp" // For token definitions, generated from parser.y
+
+// Bison 3.6 changed token "types" to "kinds"; cast to int for simple compatibility
+#define T_(name) static_cast<int>(yy::parser::token::name)
+
+struct Token {
+	int type;
+	std::variant<std::monostate, InternedStr, uint32_t, std::string> value;
+
+	Token(int type_) : type(type_), value(std::monostate{}) {
+		assume(
+		    type != T_(NUMBER) && type != T_(STRING) && type != T_(CHARACTER) && type != T_(SYMBOL)
+		    && type != T_(LABEL) && type != T_(LOCAL) && type != T_(ANON) && type != T_(QMACRO)
+		);
+	}
+	Token(int type_, uint32_t value_) : type(type_), value(value_) { assume(type == T_(NUMBER)); }
+	Token(int type_, std::string const &value_) : type(type_), value(value_) {
+		assume(type == T_(STRING) || type == T_(CHARACTER));
+	}
+	Token(int type_, std::string &&value_) : type(type_), value(std::move(value_)) {
+		assume(type == T_(STRING) || type == T_(CHARACTER));
+	}
+	Token(int type_, InternedStr value_) : type(type_), value(value_) {
+		assume(
+		    type == T_(SYMBOL) || type == T_(LABEL) || type == T_(LOCAL) || type == T_(ANON)
+		    || type == T_(QMACRO)
+		);
+	}
+};
+
+// This map lists all RGBASM keywords which `yylex_NORMAL` lexes as identifiers.
+// All non-identifier tokens are lexed separately.
+static UpperMap<int> const keywords{
+    {"ADC",           T_(SM83_ADC)         },
+    {"ADD",           T_(SM83_ADD)         },
+    {"AND",           T_(SM83_AND)         },
+    {"BIT",           T_(SM83_BIT)         },
+    {"CALL",          T_(SM83_CALL)        },
+    {"CCF",           T_(SM83_CCF)         },
+    {"CPL",           T_(SM83_CPL)         },
+    {"CP",            T_(SM83_CP)          },
+    {"DAA",           T_(SM83_DAA)         },
+    {"DEC",           T_(SM83_DEC)         },
+    {"DI",            T_(SM83_DI)          },
+    {"EI",            T_(SM83_EI)          },
+    {"HALT",          T_(SM83_HALT)        },
+    {"INC",           T_(SM83_INC)         },
+    {"JP",            T_(SM83_JP)          },
+    {"JR",            T_(SM83_JR)          },
+    {"LD",            T_(SM83_LD)          },
+    {"LDI",           T_(SM83_LDI)         },
+    {"LDD",           T_(SM83_LDD)         },
+    {"LDH",           T_(SM83_LDH)         },
+    {"NOP",           T_(SM83_NOP)         },
+    {"OR",            T_(SM83_OR)          },
+    {"POP",           T_(SM83_POP)         },
+    {"PUSH",          T_(SM83_PUSH)        },
+    {"RES",           T_(SM83_RES)         },
+    {"RETI",          T_(SM83_RETI)        },
+    {"RET",           T_(SM83_RET)         },
+    {"RLCA",          T_(SM83_RLCA)        },
+    {"RLC",           T_(SM83_RLC)         },
+    {"RLA",           T_(SM83_RLA)         },
+    {"RL",            T_(SM83_RL)          },
+    {"RRC",           T_(SM83_RRC)         },
+    {"RRCA",          T_(SM83_RRCA)        },
+    {"RRA",           T_(SM83_RRA)         },
+    {"RR",            T_(SM83_RR)          },
+    {"RST",           T_(SM83_RST)         },
+    {"SBC",           T_(SM83_SBC)         },
+    {"SCF",           T_(SM83_SCF)         },
+    {"SET",           T_(SM83_SET)         },
+    {"SLA",           T_(SM83_SLA)         },
+    {"SRA",           T_(SM83_SRA)         },
+    {"SRL",           T_(SM83_SRL)         },
+    {"STOP",          T_(SM83_STOP)        },
+    {"SUB",           T_(SM83_SUB)         },
+    {"SWAP",          T_(SM83_SWAP)        },
+    {"XOR",           T_(SM83_XOR)         },
+
+    {"NZ",            T_(CC_NZ)            },
+    {"Z",             T_(CC_Z)             },
+    {"NC",            T_(CC_NC)            },
+    // There is no `T_(CC_C)`; it's handled before as `T_(TOKEN_C)`
+
+    {"AF",            T_(MODE_AF)          },
+    {"BC",            T_(MODE_BC)          },
+    {"DE",            T_(MODE_DE)          },
+    {"HL",            T_(MODE_HL)          },
+    {"SP",            T_(MODE_SP)          },
+    {"HLD",           T_(MODE_HL_DEC)      },
+    {"HLI",           T_(MODE_HL_INC)      },
+
+    {"A",             T_(TOKEN_A)          },
+    {"B",             T_(TOKEN_B)          },
+    {"C",             T_(TOKEN_C)          },
+    {"D",             T_(TOKEN_D)          },
+    {"E",             T_(TOKEN_E)          },
+    {"H",             T_(TOKEN_H)          },
+    {"L",             T_(TOKEN_L)          },
+
+    {"DEF",           T_(OP_DEF)           },
+
+    {"FRAGMENT",      T_(POP_FRAGMENT)     },
+    {"BANK",          T_(OP_BANK)          },
+    {"ALIGN",         T_(POP_ALIGN)        },
+
+    {"SIZEOF",        T_(OP_SIZEOF)        },
+    {"STARTOF",       T_(OP_STARTOF)       },
+
+    {"ROUND",         T_(OP_ROUND)         },
+    {"CEIL",          T_(OP_CEIL)          },
+    {"FLOOR",         T_(OP_FLOOR)         },
+    {"DIV",           T_(OP_FDIV)          },
+    {"MUL",           T_(OP_FMUL)          },
+    {"FMOD",          T_(OP_FMOD)          },
+    {"POW",           T_(OP_POW)           },
+    {"LOG",           T_(OP_LOG)           },
+    {"SIN",           T_(OP_SIN)           },
+    {"COS",           T_(OP_COS)           },
+    {"TAN",           T_(OP_TAN)           },
+    {"ASIN",          T_(OP_ASIN)          },
+    {"ACOS",          T_(OP_ACOS)          },
+    {"ATAN",          T_(OP_ATAN)          },
+    {"ATAN2",         T_(OP_ATAN2)         },
+
+    {"HIGH",          T_(OP_HIGH)          },
+    {"LOW",           T_(OP_LOW)           },
+    {"ISCONST",       T_(OP_ISCONST)       },
+
+    {"BITWIDTH",      T_(OP_BITWIDTH)      },
+    {"TZCOUNT",       T_(OP_TZCOUNT)       },
+
+    {"BYTELEN",       T_(OP_BYTELEN)       },
+    {"READFILE",      T_(OP_READFILE)      },
+    {"STRBYTE",       T_(OP_STRBYTE)       },
+    {"STRCAT",        T_(OP_STRCAT)        },
+    {"STRCHAR",       T_(OP_STRCHAR)       },
+    {"STRCMP",        T_(OP_STRCMP)        },
+    {"STRFIND",       T_(OP_STRFIND)       },
+    {"STRFMT",        T_(OP_STRFMT)        },
+    {"STRIN",         T_(OP_STRIN)         },
+    {"STRLEN",        T_(OP_STRLEN)        },
+    {"STRLWR",        T_(OP_STRLWR)        },
+    {"STRRFIND",      T_(OP_STRRFIND)      },
+    {"STRRIN",        T_(OP_STRRIN)        },
+    {"STRRPL",        T_(OP_STRRPL)        },
+    {"STRSLICE",      T_(OP_STRSLICE)      },
+    {"STRSUB",        T_(OP_STRSUB)        },
+    {"STRUPR",        T_(OP_STRUPR)        },
+
+    {"CHARCMP",       T_(OP_CHARCMP)       },
+    {"CHARLEN",       T_(OP_CHARLEN)       },
+    {"CHARSIZE",      T_(OP_CHARSIZE)      },
+    {"CHARSUB",       T_(OP_CHARSUB)       },
+    {"CHARVAL",       T_(OP_CHARVAL)       },
+    {"INCHARMAP",     T_(OP_INCHARMAP)     },
+    {"REVCHAR",       T_(OP_REVCHAR)       },
+
+    {"INCLUDE",       T_(POP_INCLUDE)      },
+    {"PRINT",         T_(POP_PRINT)        },
+    {"PRINTLN",       T_(POP_PRINTLN)      },
+    {"EXPORT",        T_(POP_EXPORT)       },
+    {"DS",            T_(POP_DS)           },
+    {"DB",            T_(POP_DB)           },
+    {"DW",            T_(POP_DW)           },
+    {"DL",            T_(POP_DL)           },
+    {"SECTION",       T_(POP_SECTION)      },
+    {"ENDSECTION",    T_(POP_ENDSECTION)   },
+    {"PURGE",         T_(POP_PURGE)        },
+
+    {"RSRESET",       T_(POP_RSRESET)      },
+    {"RSSET",         T_(POP_RSSET)        },
+
+    {"INCBIN",        T_(POP_INCBIN)       },
+    {"CHARMAP",       T_(POP_CHARMAP)      },
+    {"NEWCHARMAP",    T_(POP_NEWCHARMAP)   },
+    {"SETCHARMAP",    T_(POP_SETCHARMAP)   },
+    {"PUSHC",         T_(POP_PUSHC)        },
+    {"POPC",          T_(POP_POPC)         },
+
+    {"FAIL",          T_(POP_FAIL)         },
+    {"WARN",          T_(POP_WARN)         },
+    {"FATAL",         T_(POP_FATAL)        },
+    {"ASSERT",        T_(POP_ASSERT)       },
+    {"STATIC_ASSERT", T_(POP_STATIC_ASSERT)},
+
+    {"MACRO",         T_(POP_MACRO)        },
+    {"ENDM",          T_(POP_ENDM)         },
+    {"SHIFT",         T_(POP_SHIFT)        },
+
+    {"REPT",          T_(POP_REPT)         },
+    {"FOR",           T_(POP_FOR)          },
+    {"ENDR",          T_(POP_ENDR)         },
+    {"BREAK",         T_(POP_BREAK)        },
+
+    {"LOAD",          T_(POP_LOAD)         },
+    {"ENDL",          T_(POP_ENDL)         },
+
+    {"IF",            T_(POP_IF)           },
+    {"ELSE",          T_(POP_ELSE)         },
+    {"ELIF",          T_(POP_ELIF)         },
+    {"ENDC",          T_(POP_ENDC)         },
+
+    {"UNION",         T_(POP_UNION)        },
+    {"NEXTU",         T_(POP_NEXTU)        },
+    {"ENDU",          T_(POP_ENDU)         },
+
+    {"WRAM0",         T_(SECT_WRAM0)       },
+    {"VRAM",          T_(SECT_VRAM)        },
+    {"ROMX",          T_(SECT_ROMX)        },
+    {"ROM0",          T_(SECT_ROM0)        },
+    {"HRAM",          T_(SECT_HRAM)        },
+    {"WRAMX",         T_(SECT_WRAMX)       },
+    {"SRAM",          T_(SECT_SRAM)        },
+    {"OAM",           T_(SECT_OAM)         },
+
+    {"RB",            T_(POP_RB)           },
+    {"RW",            T_(POP_RW)           },
+    // There is no `T_(POP_RL)`; it's handled before as `T_(SM83_RL)`
+
+    {"EQU",           T_(POP_EQU)          },
+    {"EQUS",          T_(POP_EQUS)         },
+    {"REDEF",         T_(POP_REDEF)        },
+
+    {"PUSHS",         T_(POP_PUSHS)        },
+    {"POPS",          T_(POP_POPS)         },
+    {"PUSHO",         T_(POP_PUSHO)        },
+    {"POPO",          T_(POP_POPO)         },
+
+    {"OPT",           T_(POP_OPT)          },
+};
+
+static LexerState *lexerState = nullptr;
+static LexerState *lexerStateEOL = nullptr;
+
+bool lexer_AtTopLevel() {
+	return lexerState == nullptr;
+}
+
+void LexerState::clear(uint32_t lineNo_) {
+	mode = LEXER_NORMAL;
+	atLineStart = true;
+	lastToken = T_(YYEOF);
+	nextToken = 0;
+
+	ifStack.clear();
+
+	capturing = false;
+	captureBuf = nullptr;
+
+	enableExpansions = true;
+	enableStringExpansions = true;
+	expansionScanDistance = 0;
+
+	expansionStack.clear();
+
+	lineNo = lineNo_; // Will be incremented at next line start
+}
+
+static void nextLine() {
+	// Newlines read within an expansion should not increase the line count
+	if (lexerState->expansionStack.empty()) {
+		++lexerState->lineNo;
+	}
+}
+
+uint32_t lexer_GetIFDepth() {
+	return lexerState->ifStack.size();
+}
+
+void lexer_IncIFDepth() {
+	lexerState->ifStack.push_front({.ranIfBlock = false, .reachedElseBlock = false});
+}
+
+void lexer_DecIFDepth() {
+	if (lexerState->ifStack.empty()) {
+		fatal("Found `ENDC` outside of a conditional (not after an `IF`/`ELIF`/`ELSE` block)");
+	}
+
+	lexerState->ifStack.pop_front();
+}
+
+bool lexer_RanIFBlock() {
+	return lexerState->ifStack.front().ranIfBlock;
+}
+
+bool lexer_ReachedELSEBlock() {
+	return lexerState->ifStack.front().reachedElseBlock;
+}
+
+void lexer_RunIFBlock() {
+	lexerState->ifStack.front().ranIfBlock = true;
+}
+
+void lexer_ReachELSEBlock() {
+	lexerState->ifStack.front().reachedElseBlock = true;
+}
+
+void LexerState::setAsCurrentState() {
+	lexerState = this;
+}
+
+void LexerState::setFileAsNextState(std::string const &filePath, bool updateStateNow) {
+	int fd = -1;
+
+	if (filePath == "-") {
+		path = "<stdin>";
+		fd = STDIN_FILENO;
+		verbosePrint(VERB_INFO, "Opening stdin\n"); // LCOV_EXCL_LINE
+	} else {
+		struct stat statBuf;
+		if (stat(filePath.c_str(), &statBuf) != 0) {
+			// LCOV_EXCL_START
+			fatal("Failed to stat file \"%s\": %s", filePath.c_str(), strerror(errno));
+			// LCOV_EXCL_STOP
+		}
+		path = filePath;
+
+		if (std::streamsize size = statBuf.st_size; statBuf.st_size > 0) {
+			// Read the entire file for better performance
+			// Ideally we'd use C++20 `content.ptr = std::make_shared<char[]>(size)`,
+			// but it has insufficient compiler support
+			content.ptr = std::shared_ptr<char[]>(new char[size]);
+			content.size = static_cast<size_t>(size);
+
+			if (std::ifstream fs(path, std::ios::binary); !fs) {
+				// LCOV_EXCL_START
+				fatal("Failed to open file \"%s\": %s", path.c_str(), strerror(errno));
+				// LCOV_EXCL_STOP
+			} else if (!fs.read(content.ptr.get(), size) || fs.gcount() != size) {
+				// LCOV_EXCL_START
+				fatal("Failed to read file \"%s\": %s", path.c_str(), strerror(errno));
+				// LCOV_EXCL_STOP
+			}
+
+			// LCOV_EXCL_START
+			verbosePrint(VERB_INFO, "File \"%s\" is fully read\n", path.c_str());
+			// LCOV_EXCL_STOP
+		} else {
+			// LCOV_EXCL_START
+			if (statBuf.st_size == 0) {
+				verbosePrint(VERB_INFO, "File \"%s\" is empty\n", path.c_str());
+			} else {
+				verbosePrint(
+				    VERB_INFO, "Failed to stat file \"%s\": %s\n", path.c_str(), strerror(errno)
+				);
+			}
+			// LCOV_EXCL_STOP
+
+			// Have a fallback if measuring the file size failed
+			fd = open(path.c_str(), O_RDONLY);
+			if (fd < 0) {
+				// LCOV_EXCL_START
+				fatal("Failed to open file \"%s\": %s", path.c_str(), strerror(errno));
+				// LCOV_EXCL_STOP
+			}
+
+			verbosePrint(VERB_INFO, "File \"%s\" is opened\n", path.c_str()); // LCOV_EXCL_LINE
+		}
+	}
+
+	if (fd >= 0) {
+		// If the file is stdin, or if measuring its size failed, read it in pieces
+		Defer closeFile{[&] { xclose(fd); }};
+
+		// Reasonably large buffer size for `read` performance
+		char buf[8192];
+		// POSIX specifies that lengths greater than SSIZE_MAX yield implementation-defined results
+		static_assert(sizeof(buf) <= SSIZE_MAX, "Lexer buffer size is too large");
+
+		auto vec = std::make_shared<std::vector<char>>();
+		for (;;) {
+			ssize_t ret = read(fd, buf, sizeof(buf));
+			// Exit on errors, unless we only were interrupted
+			if (ret == -1 && errno != EINTR) {
+				// LCOV_EXCL_START
+				fatal("Failed to read file \"%s\": %s", path.c_str(), strerror(errno));
+				// LCOV_EXCL_STOP
+			}
+			// EOF reached
+			if (ret == 0) {
+				break;
+			}
+			// If anything was read, accumulate it, and continue
+			if (ret != -1) {
+				vec->insert(vec->end(), buf, buf + ret);
+			}
+		}
+		content.ptr = std::shared_ptr<char[]>(vec, vec->data());
+		content.size = vec->size();
+
+		verbosePrint(VERB_INFO, "File \"%s\" is fully read\n", path.c_str()); // LCOV_EXCL_LINE
+	}
+
+	offset = 0;
+	clear(0);
+	if (updateStateNow) {
+		lexerState = this;
+	} else {
+		lexerStateEOL = this;
+	}
+}
+
+void LexerState::setViewAsNextState(
+    char const *name, ContentSpan const &content_, uint32_t lineNo_
+) {
+	path = name; // Used to report read errors in `.peek()`
+	content = content_;
+	offset = 0;
+	clear(lineNo_);
+	lexerStateEOL = this;
+}
+
+void lexer_RestartRept(uint32_t lineNo) {
+	lexerState->offset = 0;
+	lexerState->clear(lineNo);
+}
+
+LexerState::~LexerState() {
+	// A big chunk of the lexer state soundness is the file stack ("fstack").
+	// Each context in the fstack has its own *unique* lexer state; thus, we always guarantee
+	// that lexer states lifetimes are always properly managed, since they're handled solely
+	// by the fstack... with *one* exception.
+	// Assume a context is pushed on top of the fstack, and the corresponding lexer state gets
+	// scheduled at EOF; `lexerStateEOL` thus becomes a (weak) ref to that lexer state...
+	// It has been possible, due to a bug, that the corresponding fstack context gets popped
+	// before EOL, deleting the associated state... but it would still be switched to at EOL.
+	// This assumption checks that this doesn't happen again.
+	// It could be argued that deleting a state that's scheduled for EOF could simply clear
+	// `lexerStateEOL`, but there's currently no situation in which this should happen.
+	assume(this != lexerStateEOL);
+}
+
+bool Expansion::advance() {
+	assume(offset <= size());
+	return ++offset > size();
+}
+
+void lexer_SetMode(LexerMode mode) {
+	lexerState->mode = mode;
+}
+
+void lexer_ToggleStringExpansion(bool enable) {
+	lexerState->enableStringExpansions = enable;
+}
+
+// Functions for the actual lexer to obtain characters
+
+static void beginExpansion(std::shared_ptr<std::string> str, std::optional<InternedStr> name) {
+	if (name) {
+		lexer_CheckRecursionDepth();
+	}
+
+	// Do not expand empty strings
+	if (str->empty()) {
+		return;
+	}
+
+	lexerState->expansionStack.push_front({.name = name, .contents = str, .offset = 0});
+}
+
+void lexer_CheckRecursionDepth() {
+	if (lexerState->expansionStack.size() > options.maxRecursionDepth + 1) {
+		fatal("Recursion limit (%zu) exceeded", options.maxRecursionDepth);
+	}
+}
+
+static bool isMacroChar(char c) {
+	return c == '@' || c == '#' || c == '<' || (c >= '1' && c <= '9');
+}
+
+// Forward declarations for `readBracketedMacroArgNum`
+static int peek();
+static void shiftChar();
+static int bumpChar();
+static int nextChar();
+template<uint32_t Base>
+    requires ValidBaseV<Base>
+static uint32_t readNumber(int initial, char const *prefix);
+
+static uint32_t readBracketedMacroArgNum() {
+	bool enableExpansions = lexerState->enableExpansions;
+	lexerState->enableExpansions = true;
+	Defer restoreExpansions{[&] { lexerState->enableExpansions = enableExpansions; }};
+
+	int32_t num = 0;
+	int c = peek();
+	bool empty = false;
+	bool symbolError = false;
+
+	if (c == '-' || isDigit<10>(c)) {
+		bool negative = c == '-';
+		if (negative) {
+			c = nextChar();
+			if (!isDigit<10>(c)) {
+				error("No digit after minus sign in bracketed macro argument");
+				return 0;
+			}
+		}
+		uint32_t n = readNumber<10>(bumpChar(), nullptr);
+		if (n > INT32_MAX && !(negative && n == static_cast<uint32_t>(INT32_MAX) + 1)) {
+			error("Number in bracketed macro argument is too large");
+			return 0;
+		}
+		num = negative ? -n : static_cast<int32_t>(n);
+	} else if (startsIdentifier(c) || c == '#') {
+		if (c == '#') {
+			c = nextChar();
+			if (!startsIdentifier(c)) {
+				error("Empty raw symbol in bracketed macro argument");
+				return 0;
+			}
+		}
+
+		std::string builder;
+		for (; continuesIdentifier(c); c = nextChar()) {
+			builder += c;
+		}
+
+		InternedStr symName = intern(builder);
+
+		if (Symbol const *sym = sym_FindScopedValidSymbol(symName); !sym) {
+			if (sym_IsPurgedScoped(symName)) {
+				error("Bracketed symbol `%s` does not exist; it was purged", symName.c_str());
+			} else {
+				error("Bracketed symbol `%s` does not exist", symName.c_str());
+			}
+			num = 0;
+			symbolError = true;
+		} else if (!sym->isNumeric()) {
+			error("Bracketed symbol `%s` is not numeric", symName.c_str());
+			num = 0;
+			symbolError = true;
+		} else {
+			num = static_cast<int32_t>(sym->getConstantValue());
+		}
+	} else {
+		empty = true;
+	}
+
+	c = peek();
+	if (c != '>') {
+		error("Invalid character %s in bracketed macro argument", printChar(c));
+		return 0;
+	}
+	shiftChar();
+	if (empty) {
+		error("Empty bracketed macro argument");
+		return 0;
+	} else if (num == 0 && !symbolError) {
+		error("Invalid bracketed macro argument \"\\<0>\"");
+		return 0;
+	} else {
+		return num;
+	}
+}
+
+static std::shared_ptr<std::string> readMacroArg() {
+	if (int c = bumpChar(); c == '@') {
+		std::shared_ptr<std::string> str = fstk_GetUniqueIDStr();
+		if (!str) {
+			error("`\\@` cannot be used outside of a macro or loop (`REPT`/`FOR` block)");
+		}
+		return str;
+	} else if (MacroArgs const *macroArgs = fstk_GetCurrentMacroArgs(); c == '#') {
+		if (!macroArgs) {
+			error("`\\#` cannot be used outside of a macro");
+			return nullptr;
+		}
+
+		std::shared_ptr<std::string> str = macroArgs->getAllArgs();
+		assume(str); // '\#' should always be defined (at least as an empty string)
+		return str;
+	} else if (c == '<') {
+		int32_t num = readBracketedMacroArgNum();
+		if (num == 0) {
+			// The error was already reported by `readBracketedMacroArgNum`.
+			return nullptr;
+		}
+
+		if (!macroArgs) {
+			error("`\\<%" PRIu32 ">` cannot be used outside of a macro", num);
+			return nullptr;
+		}
+
+		std::shared_ptr<std::string> str = macroArgs->getArg(num);
+		if (!str) {
+			error("Macro argument `\\<%" PRId32 ">` not defined", num);
+		}
+		return str;
+	} else {
+		assume(c >= '1' && c <= '9');
+
+		if (!macroArgs) {
+			error("`\\%c` cannot be used outside of a macro", c);
+			return nullptr;
+		}
+
+		std::shared_ptr<std::string> str = macroArgs->getArg(c - '0');
+		if (!str) {
+			error("Macro argument `\\%c` not defined", c);
+		}
+		return str;
+	}
+}
+
+int LexerState::peekChar() {
+	// This is `.peekCharAhead()` modified for zero lookahead distance
+	for (Expansion const &exp : expansionStack) {
+		if (exp.offset < exp.size()) {
+			return static_cast<uint8_t>((*exp.contents)[exp.offset]);
+		}
+	}
+
+	if (offset < content.size) {
+		return static_cast<uint8_t>(content.ptr[offset]);
+	}
+
+	// If there aren't enough chars, give up
+	return EOF;
+}
+
+int LexerState::peekCharAhead() {
+	// We only need one character of lookahead, for macro arguments
+	uint8_t distance = 1;
+
+	for (Expansion const &exp : expansionStack) {
+		// An expansion that has reached its end will have `exp.offset` == `exp.size()`,
+		// and `.peekCharAhead()` will continue with its parent
+		assume(exp.offset <= exp.size());
+		if (size_t idx = exp.offset + distance; idx < exp.size()) {
+			// Macro args can't be recursive, since `peek()` marks them as scanned, so
+			// this is a failsafe that (as far as I can tell) won't ever actually run.
+			return static_cast<uint8_t>((*exp.contents)[idx]); // LCOV_EXCL_LINE
+		}
+		distance -= exp.size() - exp.offset;
+	}
+
+	if (offset + distance < content.size) {
+		return static_cast<uint8_t>(content.ptr[offset + distance]);
+	}
+
+	// If there aren't enough chars, give up
+	return EOF;
+}
+
+// Forward declarations for `peek`
+static std::pair<Symbol const *, std::shared_ptr<std::string>> readInterpolation(size_t depth);
+
+static int peek() {
+	for (;;) {
+		int c = lexerState->peekChar();
+
+		if (lexerState->expansionScanDistance > 0) {
+			return c;
+		}
+
+		++lexerState->expansionScanDistance; // Do not consider again
+
+		if (!lexerState->enableExpansions) {
+			return c;
+		} else if (c == '\\') {
+			// If character is a backslash, check for a macro arg
+			++lexerState->expansionScanDistance;
+			if (!isMacroChar(lexerState->peekCharAhead())) {
+				return c;
+			}
+			// If character is a macro arg char, do macro arg expansion
+			shiftChar();
+			if (std::shared_ptr<std::string> str = readMacroArg(); str) {
+				beginExpansion(str, std::nullopt);
+
+				// Mark the entire macro arg expansion as "painted blue"
+				// so that macro args can't be recursive
+				// https://en.wikipedia.org/wiki/Painted_blue
+				lexerState->expansionScanDistance += str->length();
+			}
+			// Continue in the next iteration
+		} else if (c == '{') {
+			// If character is an open brace, do symbol interpolation
+			shiftChar();
+			if (auto [sym, exp] = readInterpolation(0); sym && exp) {
+				beginExpansion(exp, sym->name);
+			}
+			// Continue in the next iteration
+		} else {
+			return c;
+		}
+	}
+}
+
+static void shiftChar() {
+	if (lexerState->capturing) {
+		if (lexerState->captureBuf) {
+			int c = peek();
+			assume(c != EOF); // Avoid calling `shiftChar()` when it could be EOF while capturing
+			lexerState->captureBuf->push_back(c);
+		}
+		++lexerState->captureSize;
+	}
+
+	assume(lexerState->expansionScanDistance > 0);
+	--lexerState->expansionScanDistance;
+
+	for (;;) {
+		if (!lexerState->expansionStack.empty()) {
+			// Advance within the current expansion
+			if (lexerState->expansionStack.front().advance()) {
+				// When advancing would go past an expansion's end,
+				// move up to its parent and try again to advance
+				lexerState->expansionStack.pop_front();
+				continue;
+			}
+		} else {
+			// Advance within the file contents
+			++lexerState->offset;
+		}
+		return;
+	}
+}
+
+static bool consumeChar(int c) {
+	// This is meant to be called when the "extra" behavior of `peek()` is not wanted,
+	// e.g. painting the peeked-at character "blue".
+	if (lexerState->peekChar() != c) {
+		return false;
+	}
+
+	// Increment `lexerState->expansionScanDistance` to prevent `shiftChar()` from calling
+	// `peek()` and to balance its decrement.
+	++lexerState->expansionScanDistance;
+	shiftChar();
+	return true;
+}
+
+static int bumpChar() {
+	int c = peek();
+	shiftChar();
+	return c;
+}
+
+static int nextChar() {
+	shiftChar();
+	return peek();
+}
+
+static int skipChars(std::predicate<int> auto predicate) {
+	int c = peek();
+	while (predicate(c)) {
+		c = nextChar();
+	}
+	return c;
+}
+
+static void handleCRLF(int c) {
+	if (c == '\r' && peek() == '\n') {
+		shiftChar();
+	}
+}
+
+static auto scopedDisableExpansions() {
+	lexerState->enableExpansions = false;
+	return Defer{[&] { lexerState->enableExpansions = true; }};
+}
+
+// "Services" provided by the lexer to the rest of the program
+
+uint32_t lexer_GetLineNo() {
+	return lexerState->lineNo;
+}
+
+void lexer_TraceStringExpansions() {
+	if (!lexerState) {
+		return;
+	}
+
+	for (Expansion const &exp : lexerState->expansionStack) {
+		// Only print EQUS expansions, not string args
+		if (exp.name) {
+			style_Set(stderr, STYLE_CYAN, false);
+			fputs("    while expanding symbol `", stderr);
+			style_Set(stderr, STYLE_CYAN, true);
+			fputs(exp.name->c_str(), stderr);
+			style_Set(stderr, STYLE_CYAN, false);
+			fputs("`\n", stderr);
+		}
+	}
+	style_Reset(stderr);
+}
+
+// Functions to discard non-tokenized characters
+
+static void discardBlockComment() {
+	Defer reenableExpansions = scopedDisableExpansions();
+	for (;;) {
+		int c = bumpChar();
+
+		switch (c) {
+		case EOF:
+			error("Unterminated block comment");
+			return;
+		case '\r':
+			handleCRLF(c);
+			[[fallthrough]];
+		case '\n':
+			nextLine();
+			continue;
+		case '/':
+			if (peek() == '*') {
+				warning(
+				    WARNING_NESTED_COMMENT,
+				    "\"/" // Prevent simple syntax highlighters from seeing this as a comment
+				    "*\" in block comment"
+				);
+			}
+			continue;
+		case '*':
+			if (peek() == '/') {
+				shiftChar();
+				return;
+			}
+			[[fallthrough]];
+		default:
+			continue;
+		}
+	}
+}
+
+static void discardComment() {
+	Defer reenableExpansions = scopedDisableExpansions();
+	skipChars([](int c) { return c != EOF && !isNewline(c); });
+}
+
+static void discardLineContinuation() {
+	for (;;) {
+		if (int c = peek(); isBlankSpace(c)) {
+			shiftChar();
+		} else if (isNewline(c)) {
+			shiftChar();
+			handleCRLF(c);
+			nextLine();
+			break;
+		} else if (c == ';') {
+			discardComment();
+		} else if (c == EOF) {
+			error("Invalid line continuation at end of file");
+			break;
+		} else {
+			error("Invalid character %s after line continuation", printChar(c));
+			break;
+		}
+	}
+}
+
+// Functions to read tokenizable values
+
+static InternedStr readAnonLabelRef(char c) {
+	assume(c == '+' || c == '-');
+
+	// We come here having already peeked at one char, so no need to do it again
+	uint32_t n = 1;
+	while (nextChar() == c) {
+		++n;
+	}
+	return sym_MakeAnonLabelName(n, c == '-');
+}
+
+static void checkDigitSeparator(bool prevWasSeparator, char const *name) {
+	if (prevWasSeparator) {
+		error("Invalid %s constant, '_' after another '_'", name);
+	}
+}
+
+static void
+    checkDigitsEnding(bool empty, char const *prefix, bool prevWasSeparator, char const *name) {
+	if (empty) {
+		error("Invalid %s constant, no digits after %s", name, prefix);
+	}
+	if (prevWasSeparator) {
+		error("Invalid %s constant, trailing '_'", name);
+	}
+}
+
+static std::tuple<uint32_t, uint32_t, bool> readFractionDigits() {
+	uint32_t dividend = 0, divisor = 1;
+	bool prevWasSeparator = false;
+
+	int c = peek();
+	if (c == '_') {
+		error("Invalid fixed-point constant, '_' after '.'");
+	}
+
+	for (;; c = nextChar()) {
+		if (c == '_') {
+			checkDigitSeparator(prevWasSeparator, "fixed-point");
+			prevWasSeparator = true;
+		} else if (isDigit<10>(c)) {
+			prevWasSeparator = false;
+			int digit = c - '0';
+			if (dividend > (UINT32_MAX - digit) / 10 || divisor > UINT32_MAX / 10) {
+				warning(
+				    WARNING_LARGE_CONSTANT, "Fixed-point constant has too many fractional digits"
+				);
+				// Discard any additional digits
+				for (int d = peek(); isDigit<10>(d) || d == '_'; c = d, d = nextChar()) {}
+				return {dividend, divisor, c == '_'};
+			}
+			dividend = dividend * 10 + digit;
+			divisor *= 10;
+		} else {
+			break;
+		}
+	}
+
+	return {dividend, divisor, prevWasSeparator};
+}
+
+static uint8_t readPrecisionSuffix() {
+	if (peek() == '.') {
+		shiftChar();
+	}
+
+	uint8_t precision = 0;
+	bool empty = true;
+
+	// '_' is not allowed after 'q'/'Q'
+	for (int c = peek(); isDigit<10>(c); c = nextChar()) {
+		empty = false;
+		int digit = c - '0';
+		if (precision > (UINT8_MAX - digit) / 10) {
+			// Discard any additional digits
+			skipChars(isDigit<10>);
+			// Return an invalid precision to cause a subsequent error, which is checked afterwards
+			// to cover the default `options.fixPrecision` as well, just in case
+			return UINT8_MAX;
+		}
+		precision = precision * 10 + digit;
+	}
+
+	if (empty) {
+		error("Invalid fixed-point constant, no digits after 'q'");
+		return options.fixPrecision;
+	}
+
+	return precision;
+}
+
+static uint32_t finishReadingFixedPoint(uint32_t integer) {
+	auto [dividend, divisor, prevWasSeparator] = readFractionDigits();
+	uint8_t precision = options.fixPrecision;
+	if (int c = peek(); c == 'q' || c == 'Q') {
+		// '_' is allowed before 'q'/'Q', so do not call `checkDigitsEnding`
+		shiftChar();
+		precision = readPrecisionSuffix();
+	} else {
+		checkDigitsEnding(false, nullptr, prevWasSeparator, "fixed-point");
+	}
+
+	if (precision < 1 || precision > 31) {
+		error("Fixed-point constant precision must be between 1 and 31");
+		precision = options.fixPrecision;
+	}
+
+	// Cast to unsigned avoids undefined overflow behavior
+	uint32_t fractional =
+	    static_cast<uint32_t>(round(static_cast<double>(dividend) / divisor * (1ULL << precision)));
+	// Carry from `fractional` to `integer` if `round` rounded up to the next integer
+	assume(fractional <= 1ULL << precision);
+	bool overflowed = false;
+	if (fractional == 1ULL << precision) {
+		overflowed = integer == UINT32_MAX;
+		++integer; // This may overflow from UINT32_MAX to 0
+		fractional = 0;
+	}
+
+	if (overflowed || integer >= 1ULL << (32 - precision)) {
+		warning(WARNING_LARGE_CONSTANT, "Magnitude of fixed-point constant is too large");
+		return 0;
+	}
+
+	return (integer << precision) | fractional;
+}
+
+static bool isValidDigit(char c) {
+	return isAlphanumeric(c) || c == '.' || c == '#' || c == '@';
+}
+
+static bool isAsmBinDigit(int c) {
+	return isDigit<2>(c) || c == options.binDigits[0] || c == options.binDigits[1];
+}
+
+static uint8_t parseAsmBinDigit(int c) {
+	assume(isAsmBinDigit(c));
+	return c == '1' || c == options.binDigits[1]; // Returns 0 or 1
+}
+
+static bool checkDigitErrors(char const *digits, size_t n, char const *type) {
+	for (size_t i = 0; i < n; ++i) {
+		char c = digits[i];
+
+		if (!isValidDigit(c)) {
+			error("Invalid digit for %s constant %s", type, printChar(c));
+			return false;
+		}
+
+		if (c >= '0' && c < static_cast<char>(n + '0') && c != static_cast<char>(i + '0')) {
+			error("Changed digit for %s constant %s", type, printChar(c));
+			return false;
+		}
+
+		for (size_t j = i + 1; j < n; ++j) {
+			if (c == digits[j]) {
+				error("Repeated digit for %s constant %s", type, printChar(c));
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+void lexer_SetBinDigits(char const digits[2]) {
+	if (size_t n = std::size(options.binDigits); checkDigitErrors(digits, n, "binary")) {
+		memcpy(options.binDigits, digits, n);
+	}
+}
+
+void lexer_SetGfxDigits(char const digits[4]) {
+	if (size_t n = std::size(options.gfxDigits); checkDigitErrors(digits, n, "graphics")) {
+		memcpy(options.gfxDigits, digits, n);
+	}
+}
+
+template<uint32_t Base>
+    requires ValidBaseV<Base>
+static uint32_t readNumber(int initial, char const *prefix) {
+	auto isSomeDigit = [](int c) {
+		if constexpr (Base == 2) {
+			return isAsmBinDigit(c);
+		} else {
+			return isDigit<Base>(c);
+		}
+	};
+	auto parseSomeDigit = [](int c) {
+		if constexpr (Base == 2) {
+			return parseAsmBinDigit(c);
+		} else {
+			return parseDigit<Base>(c);
+		}
+	};
+
+	uint32_t number;
+	bool empty;
+	if constexpr (Base == 10) {
+		assume(prefix == nullptr);
+		number = parseSomeDigit(initial);
+		empty = false;
+	} else {
+		assume(initial == 0 && prefix != nullptr);
+		number = 0;
+		empty = true;
+	}
+
+	bool prevWasSeparator = false;
+
+	for (int c = peek();; c = nextChar()) {
+		if (c == '_') {
+			checkDigitSeparator(prevWasSeparator, "integer");
+			prevWasSeparator = true;
+			continue;
+		}
+
+		if (!isSomeDigit(c)) {
+			break;
+		}
+		int digit = parseSomeDigit(c);
+		empty = false;
+		prevWasSeparator = false;
+
+		if (number > (UINT32_MAX - digit) / Base) {
+			warning(WARNING_LARGE_CONSTANT, "Integer constant is too large");
+			// Discard any additional digits
+			skipChars([&isSomeDigit](int d) { return isSomeDigit(d) || d == '_'; });
+			return 0;
+		}
+		number = number * Base + digit;
+	}
+
+	checkDigitsEnding(empty, prefix, prevWasSeparator, "integer");
+	return number;
+}
+
+static uint32_t readGfxConstant() {
+	uint32_t bitPlaneLower = 0, bitPlaneUpper = 0;
+	uint8_t width = 0;
+	bool prevWasSeparator = false;
+
+	for (int c = peek();; c = nextChar()) {
+		if (c == '_') {
+			checkDigitSeparator(prevWasSeparator, "integer");
+			prevWasSeparator = true;
+			continue;
+		}
+
+		uint32_t pixel;
+		if (c == '0' || c == options.gfxDigits[0]) {
+			pixel = 0;
+		} else if (c == '1' || c == options.gfxDigits[1]) {
+			pixel = 1;
+		} else if (c == '2' || c == options.gfxDigits[2]) {
+			pixel = 2;
+		} else if (c == '3' || c == options.gfxDigits[3]) {
+			pixel = 3;
+		} else {
+			break;
+		}
+		prevWasSeparator = false;
+
+		if (width < 8) {
+			bitPlaneLower = bitPlaneLower << 1 | (pixel & 1);
+			bitPlaneUpper = bitPlaneUpper << 1 | (pixel >> 1);
+		}
+		if (width < 9) {
+			++width;
+		}
+	}
+
+	checkDigitsEnding(width == 0, "'`'", prevWasSeparator, "graphics");
+	if (width == 9) {
+		warning(
+		    WARNING_LARGE_CONSTANT,
+		    "Graphics constant has too many digits; only first 8 pixels considered"
+		);
+	}
+
+	return bitPlaneUpper << 8 | bitPlaneLower;
+}
+
+// Functions to read identifiers and keywords
+
+static Token readIdentifier(char firstChar, bool raw) {
+	assume(startsIdentifier(firstChar));
+
+	std::string builder(1, firstChar);
+	bool keywordBeforeLocal = false;
+	int tokenType = firstChar == '.' ? T_(LOCAL) : T_(SYMBOL);
+
+	// Continue reading while the char is in the identifier charset
+	for (int c = peek(); continuesIdentifier(c); c = nextChar()) {
+		// If the char was a dot, the identifier is a local label
+		if (c == '.') {
+			// Check for a keyword before a non-raw local label
+			if (!raw && tokenType != T_(LOCAL) && keywords.find(builder) != keywords.end()) {
+				keywordBeforeLocal = true;
+			}
+
+			tokenType = T_(LOCAL);
+		}
+
+		builder += c;
+	}
+
+	// Check for a keyword if the identifier is not raw and not a local label
+	if (!raw && tokenType != T_(LOCAL)) {
+		if (auto search = keywords.find(builder); search != keywords.end()) {
+			return Token(search->second);
+		}
+	}
+
+	InternedStr identifier = intern(builder);
+
+	// Label scopes `.` and `..` are the only nonlocal identifiers that start with a dot
+	if (sym_IsDotScope(identifier)) {
+		tokenType = T_(SYMBOL);
+	}
+
+	// A keyword before a non-raw local label is an error
+	if (keywordBeforeLocal) {
+		error(
+		    "Identifier \"%s\" begins with a keyword; did you mean to put a space between them?",
+		    identifier.c_str()
+		);
+	}
+
+	return Token(tokenType, identifier);
+}
+
+// Functions to read strings
+
+static std::pair<Symbol const *, std::shared_ptr<std::string>> readInterpolation(size_t depth) {
+	if (depth > options.maxRecursionDepth) {
+		fatal("Recursion limit (%zu) exceeded", options.maxRecursionDepth);
+	}
+
+	std::string builder;
+	FormatSpec fmt{};
+	bool invalid = false;
+
+	for (;;) {
+		// Use `consumeChar()` since `peek()` might expand nested interpolations and recursively
+		// call `readInterpolation()`, which can cause stack overflow.
+		if (consumeChar('{')) {
+			if (auto [sym, exp] = readInterpolation(depth + 1); sym && exp) {
+				beginExpansion(exp, sym->name);
+			}
+			continue; // Restart, reading from the new buffer
+		} else if (int c = peek(); c == EOF || isNewline(c) || c == '"') {
+			error("Unterminated interpolation");
+			invalid = true;
+			break;
+		} else if (c == '}') {
+			shiftChar();
+			break;
+		} else if (c == ':' && !fmt.isParsed()) { // Format spec, only once
+			shiftChar();
+			size_t n = fmt.parseSpec(builder.c_str());
+			if (!fmt.isValid() || n != builder.length()) {
+				error("Invalid interpolation format spec \"%s\"", builder.c_str());
+				invalid = true;
+			}
+			builder.clear(); // Now that format has been set, restart at beginning of string.
+		} else {
+			shiftChar();
+			builder += c;
+		}
+	}
+
+	if (invalid) {
+		return {nullptr, nullptr}; // Don't allow invalid interpolation to occur.
+	}
+
+	if (builder.starts_with('#')) {
+		// Skip a '#' raw symbol prefix, but after expanding any nested interpolations.
+		builder.erase(0, 1);
+	} else if (keywords.find(builder) != keywords.end()) {
+		// Don't allow symbols that alias keywords without a '#' prefix.
+		error(
+		    "Interpolated symbol `%s` is a reserved keyword; add a '#' prefix to use it as a raw "
+		    "symbol",
+		    builder.c_str()
+		);
+		return {nullptr, nullptr};
+	}
+
+	InternedStr symName = intern(builder);
+
+	if (Symbol const *sym = sym_FindScopedValidSymbol(symName); !sym || !sym->isDefined()) {
+		if (sym_IsPurgedScoped(symName)) {
+			error("Interpolated symbol `%s` does not exist; it was purged", symName.c_str());
+		} else {
+			error("Interpolated symbol `%s` does not exist", symName.c_str());
+		}
+		return {sym, nullptr};
+	} else if (sym->type == SYM_EQUS) {
+		auto buf = std::make_shared<std::string>();
+		fmt.appendString(*buf, *sym->getEqus());
+		return {sym, buf};
+	} else if (sym->isNumeric()) {
+		auto buf = std::make_shared<std::string>();
+		fmt.appendNumber(*buf, sym->getConstantValue());
+		return {sym, buf};
+	} else {
+		error("Interpolated symbol `%s` is not a numeric or string symbol", symName.c_str());
+		return {sym, nullptr};
+	}
+}
+
+static void appendExpandedString(std::string &str, std::string const &expanded) {
+	if (lexerState->mode != LEXER_RAW) {
+		str.append(expanded);
+		return;
+	}
+
+	str.reserve(str.length() + expanded.length());
+	for (char c : expanded) {
+		// Escape characters that need escaping
+		switch (c) {
+		case '\n':
+			str += "\\n";
+			break;
+			// LCOV_EXCL_START
+		case '\r':
+			// A literal CR in a string may get treated as a LF, so '\r' is not tested.
+			str += "\\r";
+			break;
+			// LCOV_EXCL_STOP
+		case '\t':
+			str += "\\t";
+			break;
+		case '\0':
+			str += "\\0";
+			break;
+		case '\\':
+		case '"':
+		case '\'':
+		case '{':
+			str += '\\';
+			[[fallthrough]];
+		default:
+			str += c;
+			break;
+		}
+	}
+}
+
+static void appendCharInLiteral(std::string &str, int c) {
+	bool rawMode = lexerState->mode == LEXER_RAW;
+
+	// Symbol interpolation
+	if (c == '{') {
+		// We'll be exiting the string/character scope, so re-enable expansions
+		lexerState->enableExpansions = true;
+		if (auto exp = readInterpolation(0).second; exp) {
+			appendExpandedString(str, *exp);
+		}
+		lexerState->enableExpansions = false;
+		return;
+	}
+
+	// Regular characters will just get copied
+	if (c != '\\') {
+		str += c;
+		return;
+	}
+
+	c = peek();
+	switch (c) {
+	// Character escape
+	case '\\':
+	case '"':
+	case '\'':
+	case '{':
+	case '}':
+		if (rawMode) {
+			str += '\\';
+		}
+		str += c;
+		shiftChar();
+		break;
+	case 'n':
+		str += rawMode ? "\\n" : "\n";
+		shiftChar();
+		break;
+	case 'r':
+		str += rawMode ? "\\r" : "\r";
+		shiftChar();
+		break;
+	case 't':
+		str += rawMode ? "\\t" : "\t";
+		shiftChar();
+		break;
+	case '0':
+		if (rawMode) {
+			str += "\\0";
+		} else {
+			str += '\0';
+		}
+		shiftChar();
+		break;
+
+	// Line continuation
+	case ' ':
+	case '\t':
+	case '\r':
+	case '\n':
+		discardLineContinuation();
+		break;
+
+	// Macro arg
+	case '@':
+	case '#':
+	case '1':
+	case '2':
+	case '3':
+	case '4':
+	case '5':
+	case '6':
+	case '7':
+	case '8':
+	case '9':
+	case '<':
+		if (std::shared_ptr<std::string> arg = readMacroArg(); arg) {
+			appendExpandedString(str, *arg);
+		}
+		break;
+
+	case EOF: // Can't really print that one
+		error("Illegal character escape '\\' at end of input");
+		str += '\\';
+		break;
+
+	default:
+		error("Illegal character escape %s", printChar(c));
+		str += c;
+		shiftChar();
+		break;
+	}
+}
+
+static void readString(std::string &str, bool rawString) {
+	Defer reenableExpansions = scopedDisableExpansions();
+
+	bool rawMode = lexerState->mode == LEXER_RAW;
+
+	// We reach this function after reading a single quote, but we also support triple quotes
+	bool multiline = false;
+	if (rawMode) {
+		str += '"';
+	}
+	if (peek() == '"') {
+		if (rawMode) {
+			str += '"';
+		}
+		shiftChar();
+		// Use `consumeChar()` since `peek()` would mark the third character here as "painted blue"
+		// whether or not it is a third quote, which would incorrectly prevent expansions right
+		// after an empty string "".
+		if (!consumeChar('"')) {
+			// "" is an empty string, skip the loop
+			return;
+		}
+		// """ begins a multi-line string
+		if (rawMode) {
+			str += '"';
+		}
+		multiline = true;
+	}
+
+	for (;;) {
+		int c = peek();
+
+		// '\r', '\n' or EOF ends a single-line string early
+		if (c == EOF || (!multiline && isNewline(c))) {
+			error("Unterminated string");
+			return;
+		}
+
+		// We'll be staying in the string, so we can safely consume the char
+		shiftChar();
+
+		// Handle '\r' or '\n' (in multiline strings only, already handled above otherwise)
+		if (isNewline(c)) {
+			handleCRLF(c);
+			nextLine();
+			str += '\n';
+			continue;
+		}
+
+		if (c != '"') {
+			// Append the character or handle special ones
+			if (rawString) {
+				str += c;
+			} else {
+				appendCharInLiteral(str, c);
+			}
+			continue;
+		}
+
+		// Close the string and return if it's terminated
+		if (!multiline) {
+			if (rawMode) {
+				str += c;
+			}
+			return;
+		}
+		// Only """ ends a multi-line string
+		if (peek() != '"') {
+			str += c;
+			continue;
+		}
+		if (nextChar() != '"') {
+			str += "\"\"";
+			continue;
+		}
+		shiftChar();
+		if (rawMode) {
+			str += "\"\"\"";
+		}
+		return;
+	}
+}
+
+static void readCharacter(std::string &str) {
+	// This is essentially a simplified `readString`
+	Defer reenableExpansions = scopedDisableExpansions();
+
+	bool rawMode = lexerState->mode == LEXER_RAW;
+
+	// We reach this function after reading a single quote
+	if (rawMode) {
+		str += '\'';
+	}
+
+	for (;;) {
+		switch (int c = peek(); c) {
+		case '\r':
+		case '\n':
+		case EOF:
+			// '\r', '\n' or EOF ends a character early
+			error("Unterminated character");
+			return;
+		case '\'':
+			// Close the character and return if it's terminated
+			shiftChar();
+			if (rawMode) {
+				str += c;
+			}
+			return;
+		default:
+			// Append the character or handle special ones
+			shiftChar();
+			appendCharInLiteral(str, c);
+		}
+	}
+}
+
+// Lexer core
+
+static Token yylex_SKIP_TO_ENDC(); // Forward declaration for `yylex_NORMAL`
+
+// Must stay in sync with the `switch` in `yylex_NORMAL`!
+static bool isGarbageCharacter(int c) {
+	// EOF is not garbage (it can't be reported anyway)
+	if (c == EOF) {
+		return false;
+	}
+	// Whitespace characters are not garbage, even the non-"printable" ones
+	if (isWhitespace(c)) {
+		return false;
+	}
+	// Printable characters which are nevertheless garbage: braces should have been interpolated
+	if (c == '{' || c == '}') {
+		return true;
+	}
+	// All other printable characters are not garbage (i.e. `yylex_NORMAL` handles them), and
+	// all other nonprintable characters are garbage (including '\0')
+	return !isPrintable(c);
+}
+
+static void reportGarbageCharacters(int c) {
+	// '#' can be garbage if it doesn't start a raw string or identifier
+	assume(isGarbageCharacter(c) || c == '#');
+	bool isAscii = isPrintable(c);
+	if (isGarbageCharacter(peek())) {
+		// At least two characters are garbage; group them into one error report
+		std::string garbage = printChar(c);
+		while (isGarbageCharacter(peek())) {
+			c = bumpChar();
+			isAscii &= isPrintable(c);
+			garbage += ", ";
+			garbage += printChar(c);
+		}
+		error("Invalid characters %s%s", garbage.c_str(), isAscii ? "" : " (is the file UTF-8?)");
+	} else {
+		error("Invalid character %s%s", printChar(c), isAscii ? "" : " (is the file UTF-8?)");
+	}
+}
+
+static Token oneOrTwo(int c, int longer, int shorter) {
+	if (peek() == c) {
+		shiftChar();
+		return Token(longer);
+	}
+	return Token(shorter);
+}
+
+static Token oneOrTwo(int c1, int longer1, int c2, int longer2, int shorter) {
+	if (int c = peek(); c == c1) {
+		shiftChar();
+		return Token(longer1);
+	} else if (c == c2) {
+		shiftChar();
+		return Token(longer2);
+	} else {
+		return Token(shorter);
+	}
+}
+
+static Token yylex_NORMAL() {
+	if (int nextToken = lexerState->nextToken; nextToken) {
+		lexerState->nextToken = 0;
+		return Token(nextToken);
+	}
+
+	for (;;) {
+		int c = bumpChar();
+
+		switch (c) {
+			// Ignore blank space and comments
+
+		case ';':
+			discardComment();
+			[[fallthrough]];
+
+		case ' ':
+		case '\t':
+			break;
+
+			// Handle unambiguous single-char tokens
+
+		case '~':
+			return Token(T_(OP_NOT));
+
+		case '?':
+			return Token(T_(QUESTIONMARK));
+
+		case '@':
+			return Token(T_(SYMBOL), sym_GetPC()->name);
+
+		case '(':
+			return Token(T_(LPAREN));
+
+		case ')':
+			return Token(T_(RPAREN));
+
+		case ',':
+			return Token(T_(COMMA));
+
+			// Handle ambiguous 1- or 2-char tokens
+
+		case '[': // Either [ or [[
+			return oneOrTwo('[', T_(LBRACKS), T_(LBRACK));
+
+		case ']': // Either ] or ]]
+			if (peek() == ']') {
+				shiftChar();
+				// `[[ Fragment literals ]]` inject an EOL token to end their contents
+				// even without a newline. Retroactively lex the `]]` after it.
+				lexerState->nextToken = T_(RBRACKS);
+				return Token(T_(EOL));
+			}
+			return Token(T_(RBRACK));
+
+		case '+': // Either +=, ADD, or CAT
+			return oneOrTwo('=', T_(POP_ADDEQ), '+', T_(OP_CAT), T_(OP_ADD));
+
+		case '-': // Either -= or SUB
+			return oneOrTwo('=', T_(POP_SUBEQ), T_(OP_SUB));
+
+		case '*': // Either *=, MUL, or EXP
+			return oneOrTwo('=', T_(POP_MULEQ), '*', T_(OP_EXP), T_(OP_MUL));
+
+		case '/': // Either /=, DIV, or a block comment
+			if (peek() == '*') {
+				shiftChar();
+				discardBlockComment();
+				break;
+			}
+			return oneOrTwo('=', T_(POP_DIVEQ), T_(OP_DIV));
+
+		case '|': // Either |=, binary OR, or logical OR
+			return oneOrTwo('=', T_(POP_OREQ), '|', T_(OP_LOGICOR), T_(OP_OR));
+
+		case '^': // Either ^= or XOR
+			return oneOrTwo('=', T_(POP_XOREQ), T_(OP_XOR));
+
+			// Handle ambiguous 1-, 2-, or 3-char tokens
+
+		case '=': // Either assignment, EQ or string EQ
+			if (peek() == '=') {
+				shiftChar();
+				return oneOrTwo('=', T_(OP_STREQU), T_(OP_LOGICEQU));
+			}
+			return Token(T_(POP_EQUAL));
+
+		case '!': // Either negation, NEQ, or string NEQ
+			if (peek() == '=') {
+				shiftChar();
+				return oneOrTwo('=', T_(OP_STRNE), T_(OP_LOGICNE));
+			}
+			return Token(T_(OP_LOGICNOT));
+
+		case '<': // Either <<=, LT, LTE, or left shift
+			if (peek() == '<') {
+				shiftChar();
+				return oneOrTwo('=', T_(POP_SHLEQ), T_(OP_SHL));
+			}
+			return oneOrTwo('=', T_(OP_LOGICLE), T_(OP_LOGICLT));
+
+		case '>': // Either >>=, GT, GTE, or either kind of right shift
+			if (peek() == '>') {
+				shiftChar();
+				return oneOrTwo('=', T_(POP_SHREQ), '>', T_(OP_USHR), T_(OP_SHR));
+			}
+			return oneOrTwo('=', T_(OP_LOGICGE), T_(OP_LOGICGT));
+
+		case ':': // Either :, ::, or an anonymous label ref
+			c = peek();
+			if (c == '+' || c == '-') {
+				return Token(T_(ANON), readAnonLabelRef(c));
+			}
+			return oneOrTwo(':', T_(DOUBLE_COLON), T_(COLON));
+
+			// Handle numbers
+
+		case '0': // Decimal, fixed-point, or base-prefix number
+			switch (peek()) {
+			case 'x':
+			case 'X':
+				shiftChar();
+				return Token(T_(NUMBER), readNumber<16>(0, "\"0x\""));
+			case 'o':
+			case 'O':
+				shiftChar();
+				return Token(T_(NUMBER), readNumber<8>(0, "\"0o\""));
+			case 'b':
+			case 'B':
+				shiftChar();
+				return Token(T_(NUMBER), readNumber<2>(0, "\"0b\""));
+			}
+			[[fallthrough]];
+
+			// Decimal or fixed-point number
+
+		case '1':
+		case '2':
+		case '3':
+		case '4':
+		case '5':
+		case '6':
+		case '7':
+		case '8':
+		case '9': {
+			uint32_t n = readNumber<10>(c, nullptr);
+
+			if (peek() == '.') {
+				shiftChar();
+				n = finishReadingFixedPoint(n);
+			}
+			return Token(T_(NUMBER), n);
+		}
+
+		case '&': // Either &=, binary AND, logical AND, or an octal constant
+			c = peek();
+			if (isDigit<8>(c) || c == '_') {
+				return Token(T_(NUMBER), readNumber<8>(0, "'&'"));
+			}
+			return oneOrTwo('=', T_(POP_ANDEQ), '&', T_(OP_LOGICAND), T_(OP_AND));
+
+		case '%': // Either %=, MOD, or a binary constant
+			c = peek();
+			if (isAsmBinDigit(c) || c == '_') {
+				return Token(T_(NUMBER), readNumber<2>(0, "'%'"));
+			}
+			return oneOrTwo('=', T_(POP_MODEQ), T_(OP_MOD));
+
+		case '$': // Hex constant
+			return Token(T_(NUMBER), readNumber<16>(0, "'$'"));
+
+		case '`': // Gfx constant
+			return Token(T_(NUMBER), readGfxConstant());
+
+			// Handle string and character literals
+
+		case '"': {
+			std::string str;
+			readString(str, false);
+			return Token(T_(STRING), str);
+		}
+
+		case '\'': {
+			std::string chr;
+			readCharacter(chr);
+			return Token(T_(CHARACTER), chr);
+		}
+
+			// Handle newlines and EOF
+
+		case '\r':
+			handleCRLF(c);
+			[[fallthrough]];
+		case '\n':
+			return Token(T_(NEWLINE));
+
+		case EOF:
+			return Token(T_(YYEOF));
+
+			// Handle line continuations
+
+		case '\\':
+			// Macro args were handled by `peek`, and character escapes do not exist
+			// outside of string literals, so this must be a line continuation.
+			discardLineContinuation();
+			break;
+
+			// Handle raw strings... or fall through if '#' is not followed by '"'
+
+		case '#':
+			if (peek() == '"') {
+				shiftChar();
+				std::string str;
+				readString(str, true);
+				return Token(T_(STRING), str);
+			}
+			[[fallthrough]];
+
+			// Handle identifiers... or report garbage characters
+
+		default:
+			bool raw = c == '#';
+			if (raw && startsIdentifier(peek())) {
+				c = bumpChar();
+			} else if (!startsIdentifier(c)) {
+				reportGarbageCharacters(c);
+				break;
+			}
+
+			Token token = readIdentifier(c, raw);
+
+			// An ELIF after a taken IF needs to not evaluate its condition
+			if (token.type == T_(POP_ELIF) && lexerState->lastToken == T_(NEWLINE)
+			    && lexer_GetIFDepth() > 0 && lexer_RanIFBlock() && !lexer_ReachedELSEBlock()) {
+				return yylex_SKIP_TO_ENDC();
+			}
+
+			// If a keyword, don't try to expand
+			if (token.type != T_(SYMBOL) && token.type != T_(LOCAL)) {
+				return token;
+			}
+
+			// `token` is either a `SYMBOL` or a `LOCAL`, and both have an `InternedStr` value.
+			assume(std::holds_alternative<InternedStr>(token.value));
+			InternedStr identifier = std::get<InternedStr>(token.value);
+
+			// Raw symbols and local symbols cannot be string expansions
+			if (!raw && token.type == T_(SYMBOL) && lexerState->enableStringExpansions) {
+				// Attempt string expansion
+				if (Symbol const *sym = sym_FindExactSymbol(identifier);
+				    sym && sym->type == SYM_EQUS) {
+					beginExpansion(sym->getEqus(), sym->name);
+					continue; // Restart, reading from the new buffer
+				}
+			}
+
+			// We need to distinguish between:
+			// - label definitions (which are followed by a ':' and use the token `LABEL`)
+			// - quiet macro invocations (which are followed by a '?' and use the token `QMACRO`)
+			// - regular macro invocations (which use the token `SYMBOL`)
+			// - label scopes "." and ".." (which use the token `SYMBOL` no matter what)
+			//
+			// If we had one `IDENTIFIER` token, the parser would need to perform "lookahead" to
+			// determine which rule applies. But since macros need to enter "raw" mode to parse
+			// their arguments, which may not even be valid tokens in "normal" mode, we cannot use
+			// lookahead to check for the presence of a `COLON` or `QUESTIONMARK`.
+			//
+			// Instead, we have separate `SYMBOL`, `LABEL`, and `QMACRO` tokens, and decide which
+			// one to lex depending on the character *immediately* following the identifier.
+			// Thus "name:" is a label definition, and "name?" is a quiet macro invocation, but
+			// "name :" and "name ?" and just "name" are all regular macro invocations.
+			if (token.type == T_(SYMBOL) && !sym_IsDotScope(identifier)) {
+				c = peek();
+				token.type = c == ':' ? T_(LABEL) : c == '?' ? T_(QMACRO) : T_(SYMBOL);
+			}
+
+			return token;
+		}
+
+		// If we exited the switch, i.e. read some characters without yet returning a token,
+		// we can't be at the start of the line
+		lexerState->atLineStart = false;
+	}
+}
+
+static Token yylex_RAW() {
+	// This is essentially a highly modified `readString`
+	std::string str;
+	int c;
+
+	for (size_t parenDepth = 0;;) {
+		c = peek();
+
+		switch (c) {
+		case '"': // String literals inside macro args
+			shiftChar();
+			readString(str, false);
+			break;
+
+		case '\'': // Character literals inside macro args
+			shiftChar();
+			readCharacter(str);
+			break;
+
+		case '#': // Raw string literals inside macro args
+			str += c;
+			if (nextChar() == '"') {
+				shiftChar();
+				readString(str, true);
+			}
+			break;
+
+		case ';': // Comments inside macro args
+			discardComment();
+			c = peek();
+			[[fallthrough]];
+		case '\r': // End of line
+		case '\n':
+		case EOF:
+			goto finish;
+
+		case '/': // Block comments inside macro args
+			if (nextChar() == '*') {
+				shiftChar();
+				discardBlockComment();
+				continue;
+			}
+			str += c; // Append the slash
+			break;
+
+		case ',': // End of macro arg
+			if (parenDepth == 0) {
+				goto finish;
+			}
+			goto append;
+
+		case '(': // Open parentheses inside macro args
+			if (parenDepth < UINT_MAX) {
+				++parenDepth;
+			}
+			goto append;
+
+		case ')': // Close parentheses inside macro args
+			if (parenDepth > 0) {
+				--parenDepth;
+			}
+			goto append;
+
+		case '\\': // Character escape
+			c = nextChar();
+
+			switch (c) {
+			case ',': // Escapes only valid inside a macro arg
+			case '(':
+			case ')':
+			case '\\': // Escapes shared with string literals
+			case '"':
+			case '\'':
+			case '{':
+			case '}':
+				break;
+
+			case 'n':
+				c = '\n';
+				break;
+			case 'r':
+				c = '\r';
+				break;
+			case 't':
+				c = '\t';
+				break;
+			case '0':
+				c = '\0';
+				break;
+
+			case ' ':
+			case '\t':
+			case '\r':
+			case '\n':
+				discardLineContinuation();
+				continue;
+
+			case EOF: // Can't really print that one
+				error("Illegal character escape '\\' at end of input");
+				c = '\\';
+				break;
+
+				// Macro args were already handled by peek, so '\@',
+				// '\#', and '\0'-'\9' should not occur here.
+
+			default:
+				error("Illegal character escape %s", printChar(c));
+				break;
+			}
+			[[fallthrough]];
+
+		default: // Regular characters will just get copied
+append:
+			str += c;
+			shiftChar();
+			break;
+		}
+	}
+
+finish: // Can't `break` out of a nested `for`-`switch`
+	// Trim left and right blank space
+	str.erase(str.begin(), std::find_if_not(RANGE(str), isBlankSpace));
+	str.erase(std::find_if_not(RRANGE(str), isBlankSpace).base(), str.end());
+
+	// Returning COMMAs to the parser would mean that two consecutive commas
+	// (i.e. an empty argument) need to return two different tokens (STRING
+	// then COMMA) without advancing the read. To avoid this, commas in raw
+	// mode end the current macro argument but are not tokenized themselves.
+	if (c == ',') {
+		shiftChar();
+		return Token(T_(STRING), str);
+	}
+
+	// The last argument may end in a trailing comma, newline, or EOF.
+	// To allow trailing commas, raw mode will continue after the last
+	// argument, immediately lexing the newline or EOF again (i.e. with
+	// an empty raw string before it). This will not be treated as a
+	// macro argument. To pass an empty last argument, use a second
+	// trailing comma.
+	if (!str.empty()) {
+		return Token(T_(STRING), str);
+	}
+
+	lexer_SetMode(LEXER_NORMAL);
+
+	if (isNewline(c)) {
+		shiftChar();
+		handleCRLF(c);
+		return Token(T_(NEWLINE));
+	}
+
+	return Token(T_(YYEOF));
+}
+
+// This map lists all RGBASM keywords which `skipToLeadingKeyword` needs to recognize.
+// It is a subset of `keywords`.
+static UpperMap<int> const leadingKeywords{
+    // There is no need to recognize "MACRO", since macros cannot be nested
+    {"ENDM", T_(POP_ENDM)},
+
+    {"REPT", T_(POP_REPT)},
+    {"FOR",  T_(POP_FOR) },
+    {"ENDR", T_(POP_ENDR)},
+
+    {"IF",   T_(POP_IF)  },
+    {"ELSE", T_(POP_ELSE)},
+    {"ELIF", T_(POP_ELIF)},
+    {"ENDC", T_(POP_ENDC)},
+};
+
+static Token skipToLeadingKeywordFast(Procedure<> auto shiftFast) {
+	// This is essentially `skipToLeadingKeyword` with `peek` and `shiftChar` replaced,
+	// as well as anything that calls them like `nextChar` or `handleCRLF`.
+	char const *ptr = lexerState->content.ptr.get();
+	auto peekFast = [&]() {
+		return lexerState->offset < lexerState->content.size ? ptr[lexerState->offset] : EOF;
+	};
+	for (;;) {
+		int c = peekFast();
+		if (lexerState->atLineStart) {
+			lexerState->atLineStart = false;
+			while (isBlankSpace(c)) {
+				shiftFast();
+				c = peekFast();
+			}
+			if (c == EOF) {
+				return Token(T_(YYEOF));
+			} else if (isLetter(c)) {
+				size_t start = lexerState->offset;
+				shiftFast();
+				for (c = peekFast(); continuesIdentifier(c); c = peekFast()) {
+					shiftFast();
+				}
+				std::string_view leading{ptr + start, ptr + lexerState->offset};
+				if (auto search = leadingKeywords.find(leading); search != leadingKeywords.end()) {
+					// When this branch returns a token, there has been one more call to `peekFast`
+					// than to `shiftFast`. Unlike `peek` and `shiftChar`, the optimized functions
+					// do not update `lexerState->expansionScanDistance`, so it must be incremented
+					// if it was previously zero.
+					if (lexerState->expansionScanDistance == 0) {
+						++lexerState->expansionScanDistance;
+					}
+					return Token(search->second);
+				}
+			}
+		}
+		shiftFast();
+		if (c == EOF) {
+			return Token(T_(YYEOF));
+		} else if (isNewline(c)) {
+			if (c == '\r' && peekFast() == '\n') {
+				shiftFast();
+			}
+			++lexerState->lineNo;
+			lexerState->atLineStart = true;
+		}
+	}
+}
+
+// This function is called when capturing `REPT`/`FOR` loops and `MACRO` bodies,
+// and when skipping unexecuted `IF`/`ELIF`/`ELSE` blocks and `REPT`/`FOR` loops.
+// It expects that these constructs' `ENDC`/`ENDR`/`ENDM` closing tokens are only
+// valid at the start of their lines, which enables ignoring everything except
+// the leading keyword in lines that have one (as well as line continuations).
+//
+// Note that when these constructs are *evaluated*, they can perform expansions
+// (for macro args, interpolations, and macro invocations) which may produce
+// tokens that would change how these constructs were captured or skipped, if
+// they had been produced during the capture/skip non-evaluating phase.
+static Token skipToLeadingKeyword() {
+	assume(!lexerState->enableExpansions);
+
+	if (lexerState->expansionStack.empty()) {
+		// Optimize the common case (no ongoing expansions) to avoid
+		// the bookkeeping of `peek` and `shiftChar`.
+		if (lexerState->capturing) {
+			assume(lexerState->captureBuf == nullptr);
+			return skipToLeadingKeywordFast([&]() {
+				++lexerState->offset;
+				++lexerState->captureSize;
+			});
+		} else {
+			return skipToLeadingKeywordFast([&]() { ++lexerState->offset; });
+		}
+	}
+
+	for (;;) {
+		int c = peek();
+		if (lexerState->atLineStart) {
+			lexerState->atLineStart = false;
+			c = skipChars(isBlankSpace);
+			if (c == EOF) {
+				return Token(T_(YYEOF));
+			} else if (isLetter(c)) {
+				std::string builder(1, c);
+				for (c = nextChar(); continuesIdentifier(c); c = nextChar()) {
+					builder += c;
+				}
+				if (auto search = leadingKeywords.find(builder); search != leadingKeywords.end()) {
+					return Token(search->second);
+				}
+			}
+		}
+		shiftChar();
+		if (c == EOF) {
+			return Token(T_(YYEOF));
+		} else if (isNewline(c)) {
+			handleCRLF(c);
+			nextLine();
+			lexerState->atLineStart = true;
+		}
+	}
+}
+
+static Token skipIfBlock(bool toEndc) {
+	lexer_SetMode(LEXER_NORMAL);
+
+	Defer reenableExpansions = scopedDisableExpansions();
+	for (uint32_t startingDepth = lexer_GetIFDepth();;) {
+		switch (Token token = skipToLeadingKeyword(); token.type) {
+		case T_(YYEOF):
+			return token;
+
+		case T_(POP_IF):
+			lexer_IncIFDepth();
+			break;
+
+		case T_(POP_ELIF):
+			if (lexer_ReachedELSEBlock()) {
+				// This should be redundant, as the parser handles this error first.
+				fatal("Found `ELIF` after an `ELSE` block"); // LCOV_EXCL_LINE
+			}
+			if (!toEndc && lexer_GetIFDepth() == startingDepth) {
+				return token;
+			}
+			break;
+
+		case T_(POP_ELSE):
+			if (lexer_ReachedELSEBlock()) {
+				fatal("Found `ELSE` after an `ELSE` block");
+			}
+			lexer_ReachELSEBlock();
+			if (!toEndc && lexer_GetIFDepth() == startingDepth) {
+				return token;
+			}
+			break;
+
+		case T_(POP_ENDC):
+			if (lexer_GetIFDepth() == startingDepth) {
+				return token;
+			}
+			lexer_DecIFDepth();
+			break;
+		}
+	}
+}
+
+static Token yylex_SKIP_TO_ELIF() {
+	return skipIfBlock(false);
+}
+
+static Token yylex_SKIP_TO_ENDC() {
+	return skipIfBlock(true);
+}
+
+static Token yylex_SKIP_TO_ENDR() {
+	lexer_SetMode(LEXER_NORMAL);
+
+	// This does not have to look for an `ENDR` token because the entire `REPT` or `FOR` body has
+	// been captured into the current fstack context, so it can just skip to the end of that
+	// context, which yields an EOF.
+	Defer reenableExpansions = scopedDisableExpansions();
+	for (;;) {
+		switch (Token token = skipToLeadingKeyword(); token.type) {
+		case T_(YYEOF):
+			return token;
+
+		case T_(POP_IF):
+			lexer_IncIFDepth();
+			break;
+
+		case T_(POP_ENDC):
+			lexer_DecIFDepth();
+			break;
+		}
+	}
+}
+
+// LCOV_EXCL_START
+static void verboseOutputString(std::string_view str) {
+	static constexpr size_t max_len = 40;
+	putc('"', stderr);
+	for (size_t i = 0, n = str.length(); i < n; ++i) {
+		if (n > max_len && i == max_len / 2) {
+			fputs("[...]", stderr);
+			i = n - max_len / 2 - 1;
+			continue;
+		}
+		if (char c = str[i]; c == '\\') {
+			fputs("\\\\", stderr);
+		} else if (c == '"') {
+			fputs("\\\"", stderr);
+		} else if (c == '\n') {
+			fputs("\\n", stderr);
+		} else if (c == '\r') {
+			fputs("\\r", stderr);
+		} else if (c == '\t') {
+			fputs("\\t", stderr);
+		} else if (isPrintable(c)) {
+			putc(c, stderr);
+		} else {
+			fprintf(stderr, "\\x%02X", c);
+		}
+	}
+	putc('"', stderr);
+}
+// LCOV_EXCL_STOP
+
+yy::parser::symbol_type yylex() {
+	if (lexerState->atLineStart && lexerStateEOL) {
+		lexerState = lexerStateEOL;
+		lexerStateEOL = nullptr;
+	}
+	if (lexerState->lastToken == T_(EOB) && yywrap()) {
+		return yy::parser::make_YYEOF();
+	}
+	if (lexerState->atLineStart) {
+		nextLine();
+	}
+
+	static Token (* const lexerModeFuncs[NB_LEXER_MODES])() = {
+	    yylex_NORMAL,
+	    yylex_RAW,
+	    yylex_SKIP_TO_ELIF,
+	    yylex_SKIP_TO_ENDC,
+	    yylex_SKIP_TO_ENDR,
+	};
+	Token token = lexerModeFuncs[lexerState->mode]();
+
+	// Captures end at their buffer's boundary no matter what
+	if (token.type == T_(YYEOF) && !lexerState->capturing) {
+		token.type = T_(EOB);
+	}
+	lexerState->lastToken = token.type;
+	lexerState->atLineStart = token.type == T_(NEWLINE) || token.type == T_(EOB);
+
+	if (std::holds_alternative<uint32_t>(token.value)) {
+		// LCOV_EXCL_START
+		verbosePrint(
+		    VERB_TRACE,
+		    "Lexed `%s` token (0x%" PRIX32 ")\n",
+		    yy::parser::symbol_type(token.type).name(),
+		    std::get<uint32_t>(token.value)
+		);
+		// LCOV_EXCL_STOP
+		return yy::parser::symbol_type(token.type, std::get<uint32_t>(token.value));
+	} else if (std::holds_alternative<std::string>(token.value)) {
+		// LCOV_EXCL_START
+		verboseDo(VERB_TRACE, [&]() {
+			fprintf(stderr, "Lexed `%s` token (", yy::parser::symbol_type(token.type).name());
+			verboseOutputString(std::get<std::string>(token.value));
+			fputs(")\n", stderr);
+		});
+		// LCOV_EXCL_STOP
+		return yy::parser::symbol_type(token.type, std::get<std::string>(token.value));
+	} else if (std::holds_alternative<InternedStr>(token.value)) {
+		// LCOV_EXCL_START
+		verboseDo(VERB_TRACE, [&]() {
+			fprintf(
+			    stderr, "Lexed `%s` token (interned ", yy::parser::symbol_type(token.type).name()
+			);
+			verboseOutputString(std::get<InternedStr>(token.value).str());
+			fputs(")\n", stderr);
+		});
+		// LCOV_EXCL_STOP
+		return yy::parser::symbol_type(token.type, std::get<InternedStr>(token.value));
+	} else {
+		// LCOV_EXCL_START
+		verbosePrint(VERB_TRACE, "Lexed `%s` token\n", yy::parser::symbol_type(token.type).name());
+		// LCOV_EXCL_STOP
+		assume(std::holds_alternative<std::monostate>(token.value));
+		return yy::parser::symbol_type(token.type);
+	}
+}
+
+static Capture makeCapture(char const *name, InvocableR<int, int> auto callback) {
+	// Due to parser internals, it reads the EOL after the expression before calling this.
+	// Thus, we don't need to keep one in the buffer afterwards.
+	// The following assumption checks that.
+	assume(lexerState->atLineStart);
+
+	assume(!lexerState->capturing && lexerState->captureBuf == nullptr);
+	lexerState->capturing = true;
+	lexerState->captureSize = 0;
+
+	Capture capture = {
+	    .lineNo = lexer_GetLineNo(), .span = {.ptr = nullptr, .size = 0}
+	};
+	if (lexerState->expansionStack.empty()) {
+		capture.span.ptr = std::shared_ptr<char[]>(
+		    lexerState->content.ptr, &lexerState->content.ptr[lexerState->offset]
+		);
+	} else {
+		assume(lexerState->captureBuf == nullptr);
+		lexerState->captureBuf = std::make_shared<std::vector<char>>();
+		// We'll retrieve the capture buffer when done capturing
+		assume(capture.span.ptr == nullptr);
+	}
+
+	nextLine();
+
+	Defer reenableExpansions = scopedDisableExpansions();
+	for (;;) {
+		if (Token token = skipToLeadingKeyword(); token.type == T_(YYEOF)) {
+			error("Unterminated %s", name);
+			capture.span = {.ptr = nullptr, .size = lexerState->captureSize};
+			break;
+		} else if (size_t endTokenLength = callback(token.type); endTokenLength > 0) {
+			if (!capture.span.ptr) {
+				// Retrieve the capture buffer now that we're done capturing
+				capture.span.ptr =
+				    std::shared_ptr<char[]>(lexerState->captureBuf, lexerState->captureBuf->data());
+			}
+			// Subtract the length of the ending token; we know we have read it exactly,
+			// not e.g. an interpolation or EQUS expansion, since those are disabled.
+			capture.span.size = lexerState->captureSize - endTokenLength;
+			break;
+		}
+	}
+
+	// LCOV_EXCL_START
+	verboseDo(VERB_TRACE, [&]() {
+		if (capture.span.ptr) {
+			fprintf(stderr, "Captured %s (", name);
+			verboseOutputString(std::string_view{capture.span.ptr.get(), capture.span.size});
+			fputs(")\n", stderr);
+		}
+	});
+	// LCOV_EXCL_STOP
+
+	assume(!lexerState->atLineStart); // `skipToLeadingKeyword` moves past the start of the line
+
+	lexerState->capturing = false;
+	lexerState->captureBuf = nullptr;
+	return capture;
+}
+
+Capture lexer_CaptureRept() {
+	size_t depth = 0;
+	return makeCapture("loop (`REPT`/`FOR` block)", [&depth](int tokenType) {
+		if (tokenType == T_(POP_REPT) || tokenType == T_(POP_FOR)) {
+			++depth;
+		} else if (tokenType == T_(POP_ENDR)) {
+			if (depth == 0) {
+				return literal_strlen("ENDR");
+			}
+			--depth;
+		}
+		return 0;
+	});
+}
+
+Capture lexer_CaptureMacro() {
+	return makeCapture("macro definition", [](int tokenType) {
+		return tokenType == T_(POP_ENDM) ? literal_strlen("ENDM") : 0;
+	});
+}
